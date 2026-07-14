@@ -100,16 +100,34 @@ def _auth_header_string() -> str:
 @contextmanager
 def gdal_hf_env():
     """
-    Context manager that configures GDAL/rasterio to authenticate against
-    Hugging Face's resolve endpoints over /vsicurl/, so gated/private
-    datasets can be streamed without a local download.
+    Configures GDAL to authenticate against Hugging Face's resolve
+    endpoints over /vsicurl/, for both rasterio (COG reads) and pyogrio
+    (FlatGeobuf reads).
+
+    IMPORTANT: this sets *real* os.environ variables rather than using
+    rasterio.Env()/CPLSetConfigOption(). rasterio and pyogrio each vendor
+    their own separate compiled libgdal inside their wheels, so a config
+    option set via rasterio.Env only lands in rasterio's GDAL instance --
+    pyogrio's GDAL never sees it, silently drops the Authorization header,
+    and Hugging Face responds with 401. A genuine OS environment variable
+    is visible to any GDAL build via getenv(), so this is the one
+    mechanism that reliably reaches both.
     """
-    env = dict(GDAL_BASE_ENV)
+    updates = dict(GDAL_BASE_ENV)
     header = _auth_header_string()
     if header:
-        env["GDAL_HTTP_HEADERS"] = header
-    with rasterio.Env(**env):
+        updates["GDAL_HTTP_HEADERS"] = header
+
+    previous = {key: os.environ.get(key) for key in updates}
+    try:
+        os.environ.update(updates)
         yield
+    finally:
+        for key, old_value in previous.items():
+            if old_value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old_value
 
 
 def vsicurl(url: str) -> str:
