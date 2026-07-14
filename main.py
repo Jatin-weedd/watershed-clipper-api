@@ -26,6 +26,7 @@ Env vars:
 import io
 import os
 import logging
+import tempfile
 from contextlib import contextmanager
 from typing import List, Optional
 
@@ -37,10 +38,11 @@ import xarray as xr
 from rasterio.io import MemoryFile
 from rioxarray.merge import merge_arrays
 from shapely.geometry import box
+from shapely.ops import unary_union
 from huggingface_hub import HfApi, hf_hub_url
 from huggingface_hub.utils import RepositoryNotFoundError, EntryNotFoundError
 
-from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import FastAPI, HTTPException, Header, Depends, UploadFile, File
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -260,6 +262,96 @@ def fetch_watershed_geometry(watershed_id: str) -> gpd.GeoDataFrame:
     return gdf
 
 
+def find_watershed_by_geometry(query_gdf: gpd.GeoDataFrame) -> dict:
+    """
+    Given an arbitrary uploaded polygon/multipolygon, find which watershed(s)
+    in the vault it overlaps, ranked by overlap area.
+
+    Two-stage filter to stay cheap over the network:
+      1. bbox= pushdown via pyogrio -> GDAL/FlatGeobuf uses its spatial
+         index to fetch only features whose bounding box intersects the
+         query's bounding box (still streamed, not a full download).
+      2. Precise intersection-area ranking done locally on that small
+         candidate set (reprojected to a fixed projected CRS so areas are
+         directly comparable across candidates).
+    """
+    query_geom = unary_union(query_gdf.geometry)
+    query_gdf = gpd.GeoDataFrame(geometry=[query_geom], crs=query_gdf.crs)
+
+    fgb_url = _resolve_url(WATERSHED_DATASET_REPO, WATERSHED_FILE)
+
+    with gdal_hf_env():
+        try:
+            # rows=0 reads just the schema/CRS header, not any features.
+            vault_crs = gpd.read_file(
+                vsicurl(fgb_url), engine="pyogrio", rows=0
+            ).crs
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=502, detail=f"Failed to read watershed vault CRS: {exc}"
+            )
+
+        query_native = query_gdf
+        if vault_crs is not None and vault_crs != query_gdf.crs:
+            query_native = query_gdf.to_crs(vault_crs)
+
+        bbox = tuple(query_native.total_bounds)
+
+        try:
+            candidates = gpd.read_file(
+                vsicurl(fgb_url), engine="pyogrio", bbox=bbox
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=502, detail=f"Failed to query watershed vault: {exc}"
+            )
+
+    if candidates.empty:
+        raise HTTPException(
+            status_code=404,
+            detail="No watershed in the vault overlaps the uploaded geometry's bounding box.",
+        )
+
+    # EPSG:3857 is only used here as a common projected CRS to rank
+    # candidates by overlap -- fine for comparison, not for precise
+    # area-of-India measurements (it distorts area at scale).
+    candidates_proj = candidates.to_crs("EPSG:3857")
+    query_proj_geom = query_native.to_crs("EPSG:3857").geometry.iloc[0]
+
+    candidates_proj = candidates_proj.copy()
+    candidates_proj["_overlap_area"] = candidates_proj.geometry.intersection(
+        query_proj_geom
+    ).area
+    candidates_proj = candidates_proj[candidates_proj["_overlap_area"] > 0]
+
+    if candidates_proj.empty:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Bounding boxes overlapped but no watershed geometry actually "
+                "intersects the uploaded shape."
+            ),
+        )
+
+    candidates_proj = candidates_proj.sort_values("_overlap_area", ascending=False)
+    query_area = query_proj_geom.area or 1.0
+
+    top_matches = [
+        {
+            "watershed_id": str(row[WATERSHED_ID_FIELD]),
+            "overlap_fraction_of_uploaded_area": round(
+                float(row["_overlap_area"] / query_area), 4
+            ),
+        }
+        for _, row in candidates_proj.head(5).iterrows()
+    ]
+
+    return {
+        "best_match_watershed_id": top_matches[0]["watershed_id"],
+        "candidates": top_matches,
+    }
+
+
 # --------------------------------------------------------------------------
 # Raster clipping
 # --------------------------------------------------------------------------
@@ -419,6 +511,51 @@ def healthz():
         "hf_token_present": bool(HF_TOKEN),
         "api_key_protection_enabled": bool(API_KEY),
     }
+
+
+@app.post("/find-watershed", dependencies=[Depends(verify_api_key)])
+async def find_watershed(file: UploadFile = File(...)):
+    """
+    Accepts an uploaded vector file (GeoJSON, KML, Shapefile-in-zip, etc.)
+    containing a single polygon or multipolygon, and returns the
+    watershed_id(s) from the vault it best overlaps -- so a caller only
+    needs the shape, not a pre-known ID, to kick off a clip.
+    """
+    suffix = os.path.splitext(file.filename or "")[1] or ".geojson"
+    contents = await file.read()
+
+    if not contents:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    # GDAL's KML/GeoJSON drivers are more reliable against a real path
+    # than an in-memory buffer for arbitrary client-uploaded formats, so
+    # write to a short-lived temp file rather than /vsimem/.
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(contents)
+            tmp_path = tmp.name
+
+        try:
+            uploaded_gdf = gpd.read_file(tmp_path, engine="pyogrio")
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not parse uploaded vector file: {exc}",
+            )
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+    if uploaded_gdf.empty:
+        raise HTTPException(status_code=400, detail="Uploaded file contains no features.")
+
+    if uploaded_gdf.crs is None:
+        # KML is WGS84 by spec; GeoJSON is WGS84 by convention/RFC 7946.
+        # Assume that if the file didn't declare a CRS.
+        uploaded_gdf = uploaded_gdf.set_crs("EPSG:4326")
+
+    return find_watershed_by_geometry(uploaded_gdf)
 
 
 @app.post("/clip-watershed", dependencies=[Depends(verify_api_key)])
