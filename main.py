@@ -23,6 +23,15 @@ Env vars:
   COG_DATASET_REPO         - default "JS2512/india-tri"
 """
 
+import os
+
+# Get the token from environment
+hf_token = os.environ.get("HF_TOKEN")
+
+# Tell GDAL/vsicurl to use this token in the header of every request
+if hf_token:
+    os.environ["GDAL_HTTP_HEADERS"] = f"Authorization: Bearer {hf_token}"
+    os.environ["CPL_VSIL_CURL_ALLOWED_EXTENSIONS"] = "YES"
 import io
 import os
 import logging
