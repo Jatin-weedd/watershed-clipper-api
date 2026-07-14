@@ -23,15 +23,6 @@ Env vars:
   COG_DATASET_REPO         - default "JS2512/india-tri"
 """
 
-import os
-
-# Get the token from environment
-hf_token = os.environ.get("HF_TOKEN")
-
-# Tell GDAL/vsicurl to use this token in the header of every request
-if hf_token:
-    os.environ["GDAL_HTTP_HEADERS"] = f"Authorization: Bearer {hf_token}"
-    os.environ["CPL_VSIL_CURL_ALLOWED_EXTENSIONS"] = "YES"
 import io
 import os
 import logging
@@ -49,7 +40,7 @@ from shapely.geometry import box
 from huggingface_hub import HfApi, hf_hub_url
 from huggingface_hub.utils import RepositoryNotFoundError, EntryNotFoundError
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -73,6 +64,18 @@ WATERSHED_DATASET_REPO = os.environ.get(
 WATERSHED_FILE = os.environ.get("WATERSHED_FILE", "Watershed.fgb")
 WATERSHED_ID_FIELD = os.environ.get("WATERSHED_ID_FIELD", "watershed_id")
 COG_DATASET_REPO = os.environ.get("COG_DATASET_REPO", "JS2512/india-tri")
+
+# Server-side API key that clients must send back via the X-API-KEY header.
+# Set this in Render's Environment tab. If it's left unset, the endpoint
+# stays open (useful for local dev) but a warning is logged so it's never
+# silently unprotected in production.
+API_KEY = os.environ.get("API_KEY")
+if not API_KEY:
+    logger.warning(
+        "API_KEY is not set. /clip-watershed will accept requests from "
+        "anyone with no key check. Set API_KEY in the environment to lock "
+        "this down."
+    )
 
 # GDAL tuning: keep vsicurl chatty operations to a minimum and only allow
 # the extensions we actually expect, which avoids extra HEAD/LIST calls.
@@ -369,6 +372,18 @@ class ClipRequest(BaseModel):
     watershed_id: str = Field(..., description="ID of the watershed to clip against")
 
 
+def verify_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
+    """
+    FastAPI dependency that enforces the X-API-KEY header when API_KEY is
+    configured on the server. Raises 401 on a missing/incorrect key.
+    """
+    if not API_KEY:
+        # No key configured server-side -> auth check is a no-op (dev mode).
+        return
+    if not x_api_key or x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-API-KEY.")
+
+
 @app.on_event("startup")
 def _startup() -> None:
     if not HF_TOKEN:
@@ -381,10 +396,14 @@ def _startup() -> None:
 
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok", "hf_token_present": bool(HF_TOKEN)}
+    return {
+        "status": "ok",
+        "hf_token_present": bool(HF_TOKEN),
+        "api_key_protection_enabled": bool(API_KEY),
+    }
 
 
-@app.post("/clip-watershed")
+@app.post("/clip-watershed", dependencies=[Depends(verify_api_key)])
 def clip_watershed(payload: ClipRequest):
     if not HF_TOKEN:
         raise HTTPException(status_code=500, detail="Server missing HF_TOKEN.")
